@@ -33,15 +33,17 @@ namespace SPTAG::SPANN
             static constexpr const char* kUseMemImplEnv = "SPFRESH_SPDK_USE_MEM_IMPL";
             static constexpr AddressType kMemImplMaxNumBlocks = (1ULL << 30) >> PageSizeEx; // 1GB
             static constexpr const char* kUseSsdImplEnv = "SPFRESH_SPDK_USE_SSD_IMPL";
-            // static constexpr AddressType kSsdImplMaxNumBlocks = (1ULL << 40) >> PageSizeEx; // 1T
-            static constexpr AddressType kSsdImplMaxNumBlocks = 1700*1024*256; // 1.7T
+            static constexpr AddressType kSsdImplMaxNumBlocks = (1ULL << 40) >> PageSizeEx; // 1T
+            // static constexpr AddressType kSsdImplMaxNumBlocks = 1700*1024*256; // 1.7T
             static constexpr const char* kSpdkConfEnv = "SPFRESH_SPDK_CONF";
             static constexpr const char* kSpdkBdevNameEnv = "SPFRESH_SPDK_BDEV";
             static constexpr const char* kSpdkIoDepth = "SPFRESH_SPDK_IO_DEPTH";
             static constexpr int kSsdSpdkDefaultIoDepth = 1024;
 
             tbb::concurrent_queue<AddressType> m_blockAddresses;
+            tbb::concurrent_queue<AddressType> m_blockAddresses_reserve;
 
+	    std::string m_filePath;
             bool m_useSsdImpl = false;
             const char* m_ssdSpdkBdevName = nullptr;
             pthread_t m_ssdSpdkTid;
@@ -97,7 +99,7 @@ namespace SPTAG::SPANN
 
             static void SpdkStop(void* args);
         public:
-            bool Initialize(int batchSize);
+            bool Initialize(std::string filePath, int batchSize);
 
             // get p_size blocks from front, and fill in p_data array
             bool GetBlocks(AddressType* p_data, int p_size);
@@ -123,6 +125,99 @@ namespace SPTAG::SPANN
             int RemainBlocks() {
                 return m_blockAddresses.unsafe_size();
             }
+
+            ErrorCode Checkpoint(std::string prefix) {
+                std::string filename = prefix + "_blockpool";
+                LOG(Helper::LogLevel::LL_Info, "SPDK: saving block pool\n");
+                LOG(Helper::LogLevel::LL_Info, "Reload reserved blocks!\n");
+                AddressType currBlockAddress = 0;
+                for (int count = 0; count < m_blockAddresses_reserve.unsafe_size(); count++) {
+                    m_blockAddresses_reserve.try_pop(currBlockAddress);
+                    m_blockAddresses.push(currBlockAddress);
+                }
+                LOG(Helper::LogLevel::LL_Info, "Reload Finish!\n");
+                LOG(Helper::LogLevel::LL_Info, "Save blockpool To %s\n", filename.c_str());
+                auto ptr = f_createIO();
+                if (ptr == nullptr || !ptr->Initialize(filename.c_str(), std::ios::binary | std::ios::out)) return ErrorCode::FailedCreateFile;
+                int blocks = RemainBlocks();
+                IOBINARY(ptr, WriteBinary, sizeof(SizeType), (char*)&blocks);
+                for (auto it = m_blockAddresses.unsafe_begin(); it != m_blockAddresses.unsafe_end(); it++) {
+                    IOBINARY(ptr, WriteBinary, sizeof(AddressType), (char*)&(*it));
+                }
+                LOG(Helper::LogLevel::LL_Info, "Save Finish!\n");
+                return ErrorCode::Success;
+            }
+
+	    ErrorCode LoadBlockPool(std::string prefix, bool allowinit) {
+	        std::string blockfile = prefix + "_blockpool";
+                if (allowinit && !fileexists(blockfile.c_str())) {
+                    LOG(Helper::LogLevel::LL_Info, "SPDKIO::BlockController::Initialize blockpool\n");
+                    for(AddressType i = 0; i < kSsdImplMaxNumBlocks; i++) {
+                        m_blockAddresses.push(i);
+                    }
+                } else {
+                    LOG(Helper::LogLevel::LL_Info, "SPDKIO::BlockController::Load blockpool from %s\n", blockfile.c_str());
+                    auto ptr = f_createIO();
+                    if (ptr == nullptr || !ptr->Initialize(blockfile.c_str(), std::ios::binary | std::ios::in)) {
+                        LOG(Helper::LogLevel::LL_Error, "Cannot open the blockpool file: %s\n", blockfile.c_str());
+    		        return ErrorCode::Fail;
+                    }
+                    int blocks;
+		    IOBINARY(ptr, ReadBinary, sizeof(SizeType), (char*)&blocks);
+                    LOG(Helper::LogLevel::LL_Info, "SPDKIO::BlockController::Reading %d blocks to pool\n", blocks);
+                    AddressType currBlockAddress = 0;
+                    for (int i = 0; i < blocks; i++) {
+                        IOBINARY(ptr, ReadBinary, sizeof(AddressType), (char*)&(currBlockAddress));
+                        m_blockAddresses.push(currBlockAddress);
+	            }    
+    	        }
+		return ErrorCode::Success;
+	    }
+
+            ErrorCode Recovery(std::string prefix, int batchSize) {
+                std::lock_guard<std::mutex> lock(m_initMutex);
+                m_numInitCalled++;
+                LOG(Helper::LogLevel::LL_Info, "SPDK Recovery: Loading block pool\n");
+		ErrorCode ret = LoadBlockPool(prefix, false);
+                if (ret != ErrorCode::Success) return ret;
+
+                LOG(Helper::LogLevel::LL_Info, "SPDK Recovery: Initializing SPDK\n");
+                const char* useMemImplEnvStr = getenv(kUseMemImplEnv);
+                m_useMemImpl = useMemImplEnvStr && !strcmp(useMemImplEnvStr, "1");
+                const char* useSsdImplEnvStr = getenv(kUseSsdImplEnv);
+                m_useSsdImpl = useSsdImplEnvStr && !strcmp(useSsdImplEnvStr, "1");
+                if (m_useMemImpl) {
+                    LOG(Helper::LogLevel::LL_Info,"SPDK: Not support mem controller!\n");
+                    exit(0);
+                } else if (m_useSsdImpl) {
+                    if (m_numInitCalled == 1) {
+                        m_batchSize = batchSize;
+                        pthread_create(&m_ssdSpdkTid, NULL, &InitializeSpdk, this);
+                        while (!m_ssdSpdkThreadReady && !m_ssdSpdkThreadStartFailed);
+                        if (m_ssdSpdkThreadStartFailed) {
+                            fprintf(stderr, "SPDKIO::BlockController::Initialize failed\n");
+                            return ErrorCode::Fail;
+                        }
+                    }
+                    // Create sub I/O request pool
+                    m_currIoContext.sub_io_requests.resize(m_ssdSpdkIoDepth);
+                    m_currIoContext.in_flight = 0;
+                    uint32_t buf_align;
+                    buf_align = spdk_bdev_get_buf_align(m_ssdSpdkBdev);
+                    for (auto &sr : m_currIoContext.sub_io_requests) {
+                        sr.completed_sub_io_requests = &(m_currIoContext.completed_sub_io_requests);
+                        sr.app_buff = nullptr;
+                        sr.dma_buff = spdk_dma_zmalloc(PageSize, buf_align, NULL);
+                        sr.ctrl = this;
+                        m_currIoContext.free_sub_io_requests.push_back(&sr);
+                    }
+                    return ErrorCode::Success;
+                } else {
+                    fprintf(stderr, "SPDKIO::BlockController::Initialize failed\n");
+                    return ErrorCode::Fail;
+                }
+                return ErrorCode::Success;
+            }
         };
 
         class CompactionJob : public Helper::ThreadPool::Job
@@ -141,15 +236,17 @@ namespace SPTAG::SPANN
         };
 
     public:
-        SPDKIO(const char* filePath, SizeType blockSize, SizeType capacity, SizeType postingBlocks, SizeType bufferSize = 1024, int batchSize = 64, int compactionThreads = 1)
+        SPDKIO(const char* filePath, SizeType blockSize, SizeType capacity, SizeType postingBlocks, SizeType bufferSize = 1024, int batchSize = 64, bool recovery = false, int compactionThreads = 1)
         {
             m_mappingPath = std::string(filePath);
             m_blockLimit = postingBlocks + 1;
             m_bufferLimit = bufferSize;
-            if (fileexists(m_mappingPath.c_str())) {
+            if (recovery) {
+                m_mappingPath += "_blockmapping";
                 Load(m_mappingPath, blockSize, capacity);
-            }
-            else {
+            } else if (fileexists(m_mappingPath.c_str())) {
+                Load(m_mappingPath, blockSize, capacity);
+            } else {
                 m_pBlockMapping.Initialize(0, 1, blockSize, capacity);
             }
             for (int i = 0; i < bufferSize; i++) {
@@ -157,7 +254,15 @@ namespace SPTAG::SPANN
             }
             m_compactionThreadPool = std::make_shared<Helper::ThreadPool>();
             m_compactionThreadPool->init(compactionThreads);
-            m_pBlockController.Initialize(batchSize);
+            if (recovery) {
+                if (m_pBlockController.Recovery(std::string(filePath), batchSize) != ErrorCode::Success) {
+                    LOG(Helper::LogLevel::LL_Error, "Fail to Recover SPDK!\n");
+                    exit(0);
+                }
+            } else if (!m_pBlockController.Initialize(std::string(filePath), batchSize)) {
+                LOG(Helper::LogLevel::LL_Error, "Fail to Initialize SPDK!\n");
+                exit(0);
+            }
             m_shutdownCalled = false;
         }
 
@@ -169,7 +274,7 @@ namespace SPTAG::SPANN
             if (m_shutdownCalled) {
                 return;
             }
-            Save(m_mappingPath);
+            if (!m_mappingPath.empty()) Save(m_mappingPath);
             for (int i = 0; i < m_pBlockMapping.R(); i++) {
                 if (At(i) != 0xffffffffffffffff) delete[]((AddressType*)At(i));
             }
@@ -361,12 +466,19 @@ namespace SPTAG::SPANN
 
         bool Initialize(bool debug = false) override {
             if (debug) LOG(Helper::LogLevel::LL_Info, "Initialize SPDK for new threads\n");
-            return m_pBlockController.Initialize(64);
+            return m_pBlockController.Initialize(m_mappingPath, 64);
         }
 
         bool ExitBlockController(bool debug = false) override { 
             if (debug) LOG(Helper::LogLevel::LL_Info, "Exit SPDK for thread\n");
             return m_pBlockController.ShutDown(); 
+        }
+
+        ErrorCode Checkpoint(std::string prefix) override {
+            std::string filename = prefix + "_blockmapping";
+            LOG(Helper::LogLevel::LL_Info, "SPDK: saving block mapping\n");
+            Save(filename);
+            return m_pBlockController.Checkpoint(prefix);
         }
 
     private:
